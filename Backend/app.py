@@ -18,14 +18,16 @@ from storage import Store
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Vercel's normal filesystem is read-only.
-# /tmp is writable during the serverless execution.
+# Use environment variable if provided.
+# Otherwise use /tmp for serverless environments such as Vercel.
 DEFAULT_DB = os.environ.get(
     "CHAINCERT_DB",
     "/tmp/chaincert.db"
 )
 
-RECORD_ID = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+RECORD_ID = re.compile(
+    r"^[A-Za-z0-9._-]{1,40}$"
+)
 
 FIELD_LIMIT = 120
 
@@ -36,7 +38,8 @@ FIELD_LIMIT = 120
 
 def clean(value, limit=FIELD_LIMIT):
     """
-    Convert a value to a clean string and limit its length.
+    Convert a value to a clean string
+    and limit its length.
     """
     return str(
         value if value is not None else ""
@@ -45,7 +48,8 @@ def clean(value, limit=FIELD_LIMIT):
 
 def build_record(body):
     """
-    Validate and build an academic certificate record.
+    Validate and build an academic
+    certificate record.
     """
 
     record_id = clean(
@@ -111,7 +115,17 @@ def create_app(
     difficulty=DIFFICULTY
 ):
 
-    app = Flask(__name__)
+    app = Flask(
+        __name__,
+        template_folder=os.path.join(
+            BASE_DIR,
+            "../templates"
+        ),
+        static_folder=os.path.join(
+            BASE_DIR,
+            "../static"
+        )
+    )
 
     # --------------------------------------------------------
     # DATABASE / STORAGE
@@ -126,7 +140,8 @@ def create_app(
     # Load existing blockchain
     bc = store.load_chain()
 
-    # If no blockchain exists, create genesis block
+    # If no blockchain exists,
+    # create genesis block
     if bc is None:
 
         bc = Blockchain(
@@ -195,7 +210,6 @@ def create_app(
         return any(
             block.data.get("record_id")
             == record_id
-
             for block
             in state["bc"].chain[1:]
         )
@@ -214,7 +228,7 @@ def create_app(
 
 
     # ========================================================
-    # OPTIONAL VERIFY PAGE
+    # VERIFY PAGE
     # ========================================================
 
     @app.route("/verify")
@@ -343,7 +357,6 @@ def create_app(
             or {}
         )
 
-        # Get block index
         try:
 
             index = int(
@@ -359,7 +372,6 @@ def create_app(
                 error="invalid block index"
             ), 400
 
-
         with lock:
 
             chain = state["bc"]
@@ -373,7 +385,6 @@ def create_app(
                     error="invalid block index"
                 ), 400
 
-
             block = chain.chain[index]
 
             # Field to modify
@@ -386,7 +397,6 @@ def create_app(
                 return jsonify(
                     error="unknown field"
                 ), 400
-
 
             # Modify the data
             block.data[field] = clean(
@@ -410,17 +420,14 @@ def create_app(
                     block.compute_hash()
                 )
 
-
             # Save tampered chain
             store.save_chain(
                 chain
             )
 
-
             # Activity log
             store.log_event(
                 "tamper",
-
                 (
                     f"Simulated edit on "
                     f"block {index}, "
@@ -434,7 +441,6 @@ def create_app(
                     )
                 )
             )
-
 
             return jsonify(
 
@@ -475,7 +481,6 @@ def create_app(
 
                 store.log_event(
                     "verify",
-
                     (
                         f"Verified "
                         f"{record_id}: "
@@ -487,14 +492,12 @@ def create_app(
 
                 store.log_event(
                     "verify",
-
                     (
                         f"Verified "
                         f"{record_id}: "
                         f"not found"
                     )
                 )
-
 
             return jsonify(
                 result
@@ -505,7 +508,9 @@ def create_app(
     # GET SAMPLE CERTIFICATES
     # ========================================================
 
-    @app.route("/api/samples")
+    @app.route(
+        "/api/samples"
+    )
     def samples():
 
         return jsonify(
@@ -539,7 +544,6 @@ def create_app(
 
             for sample in SAMPLE_CERTIFICATES:
 
-                # Skip duplicate records
                 if has_record(
                     sample["record_id"]
                 ):
@@ -547,7 +551,6 @@ def create_app(
                     skipped += 1
 
                     continue
-
 
                 data, error = build_record(
                     sample
@@ -557,25 +560,20 @@ def create_app(
 
                     continue
 
-
                 issue(
                     data
                 )
 
                 added += 1
 
-
             store.log_event(
-
                 "samples",
-
                 (
                     f"Loaded {added} "
                     f"sample certificates "
                     f"({skipped} already present)"
                 )
             )
-
 
             return jsonify(
 
@@ -589,11 +587,12 @@ def create_app(
     # ACTIVITY LOG
     # ========================================================
 
-    @app.route("/api/events")
+    @app.route(
+        "/api/events"
+    )
     def events():
 
         return jsonify(
-
             events=store.recent_events()
         )
 
@@ -602,7 +601,9 @@ def create_app(
     # EXPORT BLOCKCHAIN
     # ========================================================
 
-    @app.route("/api/export")
+    @app.route(
+        "/api/export"
+    )
     def export():
 
         with lock:
@@ -610,7 +611,6 @@ def create_app(
             chain = state["bc"]
 
             payload = json.dumps(
-
                 {
                     "difficulty":
                         chain.difficulty,
@@ -618,10 +618,8 @@ def create_app(
                     "chain":
                         chain.to_list()
                 },
-
                 indent=2
             )
-
 
             return Response(
 
@@ -652,22 +650,18 @@ def create_app(
 
         with lock:
 
-            # Create fresh blockchain
             state["bc"] = Blockchain(
                 state["bc"].difficulty
             )
 
-            # Save new chain
             store.save_chain(
                 state["bc"]
             )
 
-            # Log reset
             store.log_event(
                 "system",
                 "Chain reset to a new genesis block"
             )
-
 
             return jsonify(
                 ok=True
@@ -678,14 +672,15 @@ def create_app(
     # HEALTH CHECK
     # ========================================================
 
-    @app.route("/api/health")
+    @app.route(
+        "/api/health"
+    )
     def health():
 
         with lock:
 
             report = (
-                state["bc"]
-                .validate_report()
+                state["bc"].validate_report()
             )
 
             return jsonify(
@@ -714,11 +709,9 @@ def create_app(
 
 
 # ============================================================
-# VERCEL / PRODUCTION ENTRY POINT
+# PRODUCTION ENTRY POINT
 # ============================================================
 
-# IMPORTANT:
-# Vercel looks for a top-level variable named "app".
 app = create_app()
 
 
@@ -727,11 +720,6 @@ app = create_app()
 # ============================================================
 
 if __name__ == "__main__":
-
-    # Optional:
-    # python app.py --seed
-    #
-    # This loads the sample certificates.
 
     if "--seed" in sys.argv:
 
@@ -746,11 +734,9 @@ if __name__ == "__main__":
                 response.get_json()
             )
 
-
-    # Start Flask locally
     app.run(
 
-        host="127.0.0.1",
+        host="0.0.0.0",
 
         port=int(
             os.environ.get(
