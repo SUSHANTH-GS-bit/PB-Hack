@@ -13,45 +13,39 @@ from storage import Store
 
 
 # ============================================================
-# CONFIGURATION
+# PATHS
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Use environment variable if provided.
-# Otherwise use /tmp for serverless environments such as Vercel.
+# Vercel filesystem is read-only except /tmp
 DEFAULT_DB = os.environ.get(
     "CHAINCERT_DB",
     "/tmp/chaincert.db"
 )
 
-RECORD_ID = re.compile(
-    r"^[A-Za-z0-9._-]{1,40}$"
-)
+# Frontend is outside Backend:
+# PB-Hack/
+# ├── Backend/app.py
+# └── FrontEnd/index.html
+FRONTEND_DIR = os.path.join(BASE_DIR, "../FrontEnd")
 
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+RECORD_ID = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 FIELD_LIMIT = 120
 
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
 def clean(value, limit=FIELD_LIMIT):
-    """
-    Convert a value to a clean string
-    and limit its length.
-    """
     return str(
         value if value is not None else ""
     ).strip()[:limit]
 
 
 def build_record(body):
-    """
-    Validate and build an academic
-    certificate record.
-    """
-
     record_id = clean(
         body.get("record_id"),
         40
@@ -65,49 +59,34 @@ def build_record(body):
         body.get("course")
     )
 
-    # Required fields
     if not record_id or not student or not course:
         return None, (
             "record_id, student_name and course are required"
         )
 
-    # Validate certificate ID
     if not RECORD_ID.match(record_id):
         return None, (
             "record_id may only contain letters, "
             "digits, dot, dash and underscore"
         )
 
-    record = {
+    return {
         "record_id": record_id,
-
         "student_name": student,
-
         "course": course,
-
-        "marks": clean(
-            body.get("marks")
-        ),
-
-        "issuer": (
-            clean(body.get("issuer"))
-            or ISSUER
-        ),
-
-        "issue_date": (
-            clean(
-                body.get("issue_date"),
-                20
-            )
-            or time.strftime("%Y-%m-%d")
-        ),
-    }
-
-    return record, None
+        "marks": clean(body.get("marks")),
+        "issuer": clean(
+            body.get("issuer")
+        ) or ISSUER,
+        "issue_date": clean(
+            body.get("issue_date"),
+            20
+        ) or time.strftime("%Y-%m-%d"),
+    }, None
 
 
 # ============================================================
-# CREATE FLASK APPLICATION
+# APPLICATION FACTORY
 # ============================================================
 
 def create_app(
@@ -115,21 +94,12 @@ def create_app(
     difficulty=DIFFICULTY
 ):
 
+    # IMPORTANT:
+    # index.html is inside ../FrontEnd
     app = Flask(
         __name__,
-        template_folder=os.path.join(
-            BASE_DIR,
-            "../templates"
-        ),
-        static_folder=os.path.join(
-            BASE_DIR,
-            "../static"
-        )
+        template_folder=FRONTEND_DIR
     )
-
-    # --------------------------------------------------------
-    # DATABASE / STORAGE
-    # --------------------------------------------------------
 
     store = Store(
         db_path or DEFAULT_DB
@@ -140,17 +110,10 @@ def create_app(
     # Load existing blockchain
     bc = store.load_chain()
 
-    # If no blockchain exists,
-    # create genesis block
     if bc is None:
+        bc = Blockchain(difficulty)
 
-        bc = Blockchain(
-            difficulty
-        )
-
-        store.save_chain(
-            bc
-        )
+        store.save_chain(bc)
 
         store.log_event(
             "system",
@@ -158,60 +121,54 @@ def create_app(
         )
 
     else:
-
         store.log_event(
             "system",
             f"Chain restored from storage "
             f"({len(bc.chain)} blocks)"
         )
 
-    # Store blockchain in application state
     state = {
         "bc": bc
     }
 
+
     # ========================================================
-    # INTERNAL FUNCTIONS
+    # ISSUE RECORD
     # ========================================================
 
     def issue(data):
 
         start = time.perf_counter()
 
-        block = state["bc"].add_record(
-            data
-        )
+        block = state["bc"].add_record(data)
 
-        elapsed_ms = (
+        ms = (
             time.perf_counter() - start
         ) * 1000
 
-        # Save blockchain
         store.save_chain(
             state["bc"]
         )
 
-        # Activity log
         store.log_event(
             "mined",
-            (
-                f"Block {block.index} mined "
-                f"for {data['record_id']} "
-                f"(nonce {block.nonce}, "
-                f"{elapsed_ms:.0f} ms)"
-            )
+            f"Block {block.index} mined for "
+            f"{data['record_id']} "
+            f"(nonce {block.nonce}, {ms:.0f} ms)"
         )
 
-        return block, elapsed_ms
+        return block, ms
 
+
+    # ========================================================
+    # CHECK DUPLICATE RECORD
+    # ========================================================
 
     def has_record(record_id):
 
         return any(
-            block.data.get("record_id")
-            == record_id
-            for block
-            in state["bc"].chain[1:]
+            b.data.get("record_id") == record_id
+            for b in state["bc"].chain[1:]
         )
 
 
@@ -240,6 +197,31 @@ def create_app(
 
 
     # ========================================================
+    # HEALTH CHECK
+    # ========================================================
+
+    @app.route("/api/health")
+    def health():
+
+        with lock:
+
+            chain = state["bc"]
+
+            report = chain.validate_report()
+
+            return jsonify(
+                status="online",
+                service="ChainCert",
+                blockchain_valid=report["valid"],
+                blocks=len(chain.chain),
+                storage="SQLite",
+                database=os.path.basename(
+                    store.path
+                )
+            )
+
+
+    # ========================================================
     # GET BLOCKCHAIN
     # ========================================================
 
@@ -250,9 +232,7 @@ def create_app(
 
             chain = state["bc"]
 
-            report = (
-                chain.validate_report()
-            )
+            report = chain.validate_report()
 
             return jsonify(
 
@@ -262,9 +242,9 @@ def create_app(
 
                 problems=report["problems"],
 
-                bad_blocks=(
-                    report["summary"]["flagged"]
-                ),
+                bad_blocks=report[
+                    "summary"
+                ]["flagged"],
 
                 blocks=report["blocks"],
 
@@ -282,7 +262,7 @@ def create_app(
 
 
     # ========================================================
-    # ADD CERTIFICATE / RECORD
+    # ADD CERTIFICATE
     # ========================================================
 
     @app.route(
@@ -291,13 +271,10 @@ def create_app(
     )
     def add_record():
 
-        body = (
-            request.get_json(
-                force=True,
-                silent=True
-            )
-            or {}
-        )
+        body = request.get_json(
+            force=True,
+            silent=True
+        ) or {}
 
         data, error = build_record(
             body
@@ -311,7 +288,6 @@ def create_app(
 
         with lock:
 
-            # Prevent duplicate certificate IDs
             if has_record(
                 data["record_id"]
             ):
@@ -320,10 +296,7 @@ def create_app(
                     error="record_id already exists"
                 ), 409
 
-            # Add record to blockchain
-            block, elapsed_ms = issue(
-                data
-            )
+            block, ms = issue(data)
 
             return jsonify(
 
@@ -331,16 +304,13 @@ def create_app(
 
                 mining={
                     "nonce": block.nonce,
-                    "ms": round(
-                        elapsed_ms,
-                        1
-                    )
+                    "ms": round(ms, 1)
                 }
             )
 
 
     # ========================================================
-    # TAMPER BLOCK
+    # SIMULATE TAMPERING
     # ========================================================
 
     @app.route(
@@ -349,17 +319,14 @@ def create_app(
     )
     def tamper():
 
-        body = (
-            request.get_json(
-                force=True,
-                silent=True
-            )
-            or {}
-        )
+        body = request.get_json(
+            force=True,
+            silent=True
+        ) or {}
 
         try:
 
-            index = int(
+            idx = int(
                 body.get("index")
             )
 
@@ -372,12 +339,12 @@ def create_app(
                 error="invalid block index"
             ), 400
 
+
         with lock:
 
             chain = state["bc"]
 
-            # Genesis block cannot be tampered
-            if not 1 <= index < len(
+            if not 1 <= idx < len(
                 chain.chain
             ):
 
@@ -385,9 +352,9 @@ def create_app(
                     error="invalid block index"
                 ), 400
 
-            block = chain.chain[index]
 
-            # Field to modify
+            block = chain.chain[idx]
+
             field = body.get(
                 "field"
             )
@@ -398,55 +365,55 @@ def create_app(
                     error="unknown field"
                 ), 400
 
-            # Modify the data
+
+            # Modify stored data
             block.data[field] = clean(
                 body.get("value")
             )
 
-            # Optional attacker rehash
+
+            # Advanced attacker:
+            # change data AND recompute hash
             rehash = bool(
                 body.get("rehash")
             )
 
+
             if rehash:
 
-                block.field_hashes = (
-                    fingerprints(
-                        block.data
-                    )
+                block.field_hashes = fingerprints(
+                    block.data
                 )
 
-                block.hash = (
-                    block.compute_hash()
-                )
+                block.hash = block.compute_hash()
 
-            # Save tampered chain
+
             store.save_chain(
                 chain
             )
 
-            # Activity log
+
             store.log_event(
+
                 "tamper",
+
+                f"Simulated edit on block {idx}, "
+                f"field '{field}'"
+                +
                 (
-                    f"Simulated edit on "
-                    f"block {index}, "
-                    f"field '{field}'"
-                    +
-                    (
-                        " (block hash recomputed by attacker)"
-                        if rehash
-                        else
-                        " (hash not recomputed)"
-                    )
+                    " (block hash recomputed by attacker)"
+                    if rehash
+                    else
+                    " (hash not recomputed)"
                 )
             )
+
 
             return jsonify(
 
                 ok=True,
 
-                index=index,
+                index=idx,
 
                 rehash=rehash
             )
@@ -463,14 +430,13 @@ def create_app(
 
         with lock:
 
-            result = (
-                state["bc"]
-                .verify_record(
-                    record_id
-                )
+            result = state[
+                "bc"
+            ].verify_record(
+                record_id
             )
 
-            # Activity logging
+
             if result["found"]:
 
                 outcome = (
@@ -480,24 +446,23 @@ def create_app(
                 )
 
                 store.log_event(
+
                     "verify",
-                    (
-                        f"Verified "
-                        f"{record_id}: "
-                        f"{outcome}"
-                    )
+
+                    f"Verified {record_id}: "
+                    f"{outcome}"
                 )
 
             else:
 
                 store.log_event(
+
                     "verify",
-                    (
-                        f"Verified "
-                        f"{record_id}: "
-                        f"not found"
-                    )
+
+                    f"Verified {record_id}: "
+                    f"not found"
                 )
+
 
             return jsonify(
                 result
@@ -505,12 +470,10 @@ def create_app(
 
 
     # ========================================================
-    # GET SAMPLE CERTIFICATES
+    # SAMPLE CERTIFICATES
     # ========================================================
 
-    @app.route(
-        "/api/samples"
-    )
+    @app.route("/api/samples")
     def samples():
 
         return jsonify(
@@ -542,6 +505,7 @@ def create_app(
             added = 0
             skipped = 0
 
+
             for sample in SAMPLE_CERTIFICATES:
 
                 if has_record(
@@ -552,28 +516,25 @@ def create_app(
 
                     continue
 
-                data, error = build_record(
+
+                data, _ = build_record(
                     sample
                 )
 
-                if error:
-
-                    continue
-
-                issue(
-                    data
-                )
+                issue(data)
 
                 added += 1
 
+
             store.log_event(
+
                 "samples",
-                (
-                    f"Loaded {added} "
-                    f"sample certificates "
-                    f"({skipped} already present)"
-                )
+
+                f"Loaded {added} "
+                f"sample certificates "
+                f"({skipped} already present)"
             )
+
 
             return jsonify(
 
@@ -587,9 +548,7 @@ def create_app(
     # ACTIVITY LOG
     # ========================================================
 
-    @app.route(
-        "/api/events"
-    )
+    @app.route("/api/events")
     def events():
 
         return jsonify(
@@ -601,9 +560,7 @@ def create_app(
     # EXPORT BLOCKCHAIN
     # ========================================================
 
-    @app.route(
-        "/api/export"
-    )
+    @app.route("/api/export")
     def export():
 
         with lock:
@@ -611,6 +568,7 @@ def create_app(
             chain = state["bc"]
 
             payload = json.dumps(
+
                 {
                     "difficulty":
                         chain.difficulty,
@@ -618,8 +576,10 @@ def create_app(
                     "chain":
                         chain.to_list()
                 },
+
                 indent=2
             )
+
 
             return Response(
 
@@ -629,11 +589,9 @@ def create_app(
 
                 headers={
                     "Content-Disposition":
-                    (
-                        "attachment; "
-                        "filename="
-                        "chaincert-chain.json"
-                    )
+                    "attachment; "
+                    "filename="
+                    "chaincert-chain.json"
                 }
             )
 
@@ -663,53 +621,21 @@ def create_app(
                 "Chain reset to a new genesis block"
             )
 
+
             return jsonify(
                 ok=True
             )
 
 
     # ========================================================
-    # HEALTH CHECK
-    # ========================================================
-
-    @app.route(
-        "/api/health"
-    )
-    def health():
-
-        with lock:
-
-            report = (
-                state["bc"].validate_report()
-            )
-
-            return jsonify(
-
-                status="online",
-
-                blockchain_valid=(
-                    report["valid"]
-                ),
-
-                blocks=len(
-                    state["bc"].chain
-                ),
-
-                difficulty=(
-                    state["bc"].difficulty
-                )
-            )
-
-
-    # ========================================================
-    # RETURN FLASK APPLICATION
+    # RETURN APPLICATION
     # ========================================================
 
     return app
 
 
 # ============================================================
-# PRODUCTION ENTRY POINT
+# TOP-LEVEL FLASK APPLICATION
 # ============================================================
 
 app = create_app()
@@ -725,14 +651,13 @@ if __name__ == "__main__":
 
         with app.test_client() as client:
 
-            response = client.post(
-                "/api/seed"
-            )
-
             print(
                 "Seeded:",
-                response.get_json()
+                client.post(
+                    "/api/seed"
+                ).get_json()
             )
+
 
     app.run(
 
@@ -749,3 +674,7 @@ if __name__ == "__main__":
 
         threaded=True
     )
+
+
+
+
