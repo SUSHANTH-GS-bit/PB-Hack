@@ -1,3 +1,0 @@
-# ChainCert runtime dependencies.
-# SQLite, hashlib, json and threading come from the Python standard library (Python 3.9 or newer).
-Flask>=3.0,<4.0
