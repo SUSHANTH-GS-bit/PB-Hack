@@ -1,18 +1,3 @@
-"""
-app.py - ChainCert Flask server: REST API + dashboard.
-
-Run:
-    python app.py
-    then open http://127.0.0.1:5000
-
-To load sample certificates:
-    python app.py --seed
-
-The chain is stored in a SQLite file (chaincert.db next to this file,
-or the path in the CHAINCERT_DB environment variable), so records
-survive restarts.
-"""
-
 import json
 import os
 import re
@@ -27,15 +12,17 @@ from samples import ISSUER, SAMPLE_CERTIFICATES
 from storage import Store
 
 
-# ---------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Vercel's normal filesystem is read-only.
+# /tmp is writable during the serverless execution.
 DEFAULT_DB = os.environ.get(
     "CHAINCERT_DB",
-    os.path.join(BASE_DIR, "chaincert.db")
+    "/tmp/chaincert.db"
 )
 
 RECORD_ID = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
@@ -43,13 +30,13 @@ RECORD_ID = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 FIELD_LIMIT = 120
 
 
-# ---------------------------------------------------------
-# Helper Functions
-# ---------------------------------------------------------
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
 
 def clean(value, limit=FIELD_LIMIT):
     """
-    Clean incoming values and limit their length.
+    Convert a value to a clean string and limit its length.
     """
     return str(
         value if value is not None else ""
@@ -58,8 +45,7 @@ def clean(value, limit=FIELD_LIMIT):
 
 def build_record(body):
     """
-    Validate request data and return:
-        (record_dict, error_message)
+    Validate and build an academic certificate record.
     """
 
     record_id = clean(
@@ -75,38 +61,61 @@ def build_record(body):
         body.get("course")
     )
 
+    # Required fields
     if not record_id or not student or not course:
-        return (
-            None,
+        return None, (
             "record_id, student_name and course are required"
         )
 
+    # Validate certificate ID
     if not RECORD_ID.match(record_id):
-        return (
-            None,
-            "record_id may only contain letters, digits, dot, dash and underscore"
+        return None, (
+            "record_id may only contain letters, "
+            "digits, dot, dash and underscore"
         )
 
-    return {
+    record = {
         "record_id": record_id,
+
         "student_name": student,
+
         "course": course,
-        "marks": clean(body.get("marks")),
-        "issuer": clean(body.get("issuer")) or ISSUER,
+
+        "marks": clean(
+            body.get("marks")
+        ),
+
+        "issuer": (
+            clean(body.get("issuer"))
+            or ISSUER
+        ),
+
         "issue_date": (
-            clean(body.get("issue_date"), 20)
+            clean(
+                body.get("issue_date"),
+                20
+            )
             or time.strftime("%Y-%m-%d")
         ),
-    }, None
+    }
+
+    return record, None
 
 
-# ---------------------------------------------------------
-# Flask Application Factory
-# ---------------------------------------------------------
+# ============================================================
+# CREATE FLASK APPLICATION
+# ============================================================
 
-def create_app(db_path=None, difficulty=DIFFICULTY):
+def create_app(
+    db_path=None,
+    difficulty=DIFFICULTY
+):
 
     app = Flask(__name__)
+
+    # --------------------------------------------------------
+    # DATABASE / STORAGE
+    # --------------------------------------------------------
 
     store = Store(
         db_path or DEFAULT_DB
@@ -114,17 +123,19 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
     lock = threading.RLock()
 
-    # -----------------------------------------------------
     # Load existing blockchain
-    # -----------------------------------------------------
-
     bc = store.load_chain()
 
+    # If no blockchain exists, create genesis block
     if bc is None:
 
-        bc = Blockchain(difficulty)
+        bc = Blockchain(
+            difficulty
+        )
 
-        store.save_chain(bc)
+        store.save_chain(
+            bc
+        )
 
         store.log_event(
             "system",
@@ -135,56 +146,64 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
         store.log_event(
             "system",
-            f"Chain restored from storage ({len(bc.chain)} blocks)"
+            f"Chain restored from storage "
+            f"({len(bc.chain)} blocks)"
         )
 
+    # Store blockchain in application state
     state = {
         "bc": bc
     }
 
-    # -----------------------------------------------------
-    # Issue / Mine Record
-    # -----------------------------------------------------
+    # ========================================================
+    # INTERNAL FUNCTIONS
+    # ========================================================
 
     def issue(data):
 
         start = time.perf_counter()
 
-        block = state["bc"].add_record(data)
+        block = state["bc"].add_record(
+            data
+        )
 
-        ms = (
+        elapsed_ms = (
             time.perf_counter() - start
         ) * 1000
 
+        # Save blockchain
         store.save_chain(
             state["bc"]
         )
 
+        # Activity log
         store.log_event(
             "mined",
             (
-                f"Block {block.index} mined for "
-                f"{data['record_id']} "
-                f"(nonce {block.nonce}, {ms:.0f} ms)"
+                f"Block {block.index} mined "
+                f"for {data['record_id']} "
+                f"(nonce {block.nonce}, "
+                f"{elapsed_ms:.0f} ms)"
             )
         )
 
-        return block, ms
+        return block, elapsed_ms
 
-    # -----------------------------------------------------
-    # Check Existing Record
-    # -----------------------------------------------------
 
     def has_record(record_id):
 
         return any(
-            b.data.get("record_id") == record_id
-            for b in state["bc"].chain[1:]
+            block.data.get("record_id")
+            == record_id
+
+            for block
+            in state["bc"].chain[1:]
         )
 
-    # -----------------------------------------------------
-    # Dashboard
-    # -----------------------------------------------------
+
+    # ========================================================
+    # MAIN PAGE
+    # ========================================================
 
     @app.route("/")
     def index():
@@ -193,9 +212,22 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
             "index.html"
         )
 
-    # -----------------------------------------------------
-    # Get Blockchain
-    # -----------------------------------------------------
+
+    # ========================================================
+    # OPTIONAL VERIFY PAGE
+    # ========================================================
+
+    @app.route("/verify")
+    def verify_page():
+
+        return render_template(
+            "index.html"
+        )
+
+
+    # ========================================================
+    # GET BLOCKCHAIN
+    # ========================================================
 
     @app.route("/api/chain")
     def get_chain():
@@ -204,7 +236,9 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
             chain = state["bc"]
 
-            report = chain.validate_report()
+            report = (
+                chain.validate_report()
+            )
 
             return jsonify(
 
@@ -214,7 +248,9 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
                 problems=report["problems"],
 
-                bad_blocks=report["summary"]["flagged"],
+                bad_blocks=(
+                    report["summary"]["flagged"]
+                ),
 
                 blocks=report["blocks"],
 
@@ -227,12 +263,13 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
                     "file": os.path.basename(
                         store.path
                     )
-                },
+                }
             )
 
-    # -----------------------------------------------------
-    # Add Certificate / Record
-    # -----------------------------------------------------
+
+    # ========================================================
+    # ADD CERTIFICATE / RECORD
+    # ========================================================
 
     @app.route(
         "/api/add",
@@ -240,10 +277,13 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
     )
     def add_record():
 
-        body = request.get_json(
-            force=True,
-            silent=True
-        ) or {}
+        body = (
+            request.get_json(
+                force=True,
+                silent=True
+            )
+            or {}
+        )
 
         data, error = build_record(
             body
@@ -257,6 +297,7 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
         with lock:
 
+            # Prevent duplicate certificate IDs
             if has_record(
                 data["record_id"]
             ):
@@ -265,7 +306,8 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
                     error="record_id already exists"
                 ), 409
 
-            block, ms = issue(
+            # Add record to blockchain
+            block, elapsed_ms = issue(
                 data
             )
 
@@ -275,13 +317,17 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
                 mining={
                     "nonce": block.nonce,
-                    "ms": round(ms, 1)
+                    "ms": round(
+                        elapsed_ms,
+                        1
+                    )
                 }
             )
 
-    # -----------------------------------------------------
-    # Tamper Detection Demo
-    # -----------------------------------------------------
+
+    # ========================================================
+    # TAMPER BLOCK
+    # ========================================================
 
     @app.route(
         "/api/tamper",
@@ -289,42 +335,37 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
     )
     def tamper():
 
-        """
-        DEMO ONLY:
+        body = (
+            request.get_json(
+                force=True,
+                silent=True
+            )
+            or {}
+        )
 
-        Edit a block's stored data like an attacker with
-        database access.
-
-        By default the hash is NOT recomputed.
-
-        With rehash=true, the attacker also recomputes the
-        block's field fingerprints and hash. This is then
-        caught by the broken link in the next block and
-        failed proof of work.
-        """
-
-        body = request.get_json(
-            force=True,
-            silent=True
-        ) or {}
-
+        # Get block index
         try:
 
-            idx = int(
+            index = int(
                 body.get("index")
             )
 
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError
+        ):
 
             return jsonify(
                 error="invalid block index"
             ), 400
 
+
         with lock:
 
             chain = state["bc"]
 
-            if not 1 <= idx < len(
+            # Genesis block cannot be tampered
+            if not 1 <= index < len(
                 chain.chain
             ):
 
@@ -332,8 +373,10 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
                     error="invalid block index"
                 ), 400
 
-            block = chain.chain[idx]
 
+            block = chain.chain[index]
+
+            # Field to modify
             field = body.get(
                 "field"
             )
@@ -344,49 +387,68 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
                     error="unknown field"
                 ), 400
 
+
+            # Modify the data
             block.data[field] = clean(
                 body.get("value")
             )
 
+            # Optional attacker rehash
             rehash = bool(
                 body.get("rehash")
             )
 
             if rehash:
 
-                block.field_hashes = fingerprints(
-                    block.data
+                block.field_hashes = (
+                    fingerprints(
+                        block.data
+                    )
                 )
 
-                block.hash = block.compute_hash()
+                block.hash = (
+                    block.compute_hash()
+                )
 
+
+            # Save tampered chain
             store.save_chain(
                 chain
             )
 
+
+            # Activity log
             store.log_event(
                 "tamper",
+
                 (
-                    f"Simulated edit on block {idx}, "
+                    f"Simulated edit on "
+                    f"block {index}, "
                     f"field '{field}'"
                     +
                     (
                         " (block hash recomputed by attacker)"
                         if rehash
-                        else " (hash not recomputed)"
+                        else
+                        " (hash not recomputed)"
                     )
                 )
             )
 
+
             return jsonify(
+
                 ok=True,
-                index=idx,
+
+                index=index,
+
                 rehash=rehash
             )
 
-    # -----------------------------------------------------
-    # Verify Certificate
-    # -----------------------------------------------------
+
+    # ========================================================
+    # VERIFY CERTIFICATE
+    # ========================================================
 
     @app.route(
         "/api/verify/<record_id>"
@@ -395,10 +457,14 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
         with lock:
 
-            result = state["bc"].verify_record(
-                record_id
+            result = (
+                state["bc"]
+                .verify_record(
+                    record_id
+                )
             )
 
+            # Activity logging
             if result["found"]:
 
                 outcome = (
@@ -409,40 +475,56 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
                 store.log_event(
                     "verify",
-                    f"Verified {record_id}: {outcome}"
+
+                    (
+                        f"Verified "
+                        f"{record_id}: "
+                        f"{outcome}"
+                    )
                 )
 
             else:
 
                 store.log_event(
                     "verify",
-                    f"Verified {record_id}: not found"
+
+                    (
+                        f"Verified "
+                        f"{record_id}: "
+                        f"not found"
+                    )
                 )
+
 
             return jsonify(
                 result
             )
 
-    # -----------------------------------------------------
-    # Sample Certificates
-    # -----------------------------------------------------
+
+    # ========================================================
+    # GET SAMPLE CERTIFICATES
+    # ========================================================
 
     @app.route("/api/samples")
     def samples():
 
         return jsonify(
+
             samples=[
                 dict(
-                    s,
+                    sample,
                     issuer=ISSUER
                 )
-                for s in SAMPLE_CERTIFICATES
+
+                for sample
+                in SAMPLE_CERTIFICATES
             ]
         )
 
-    # -----------------------------------------------------
-    # Seed Sample Certificates
-    # -----------------------------------------------------
+
+    # ========================================================
+    # SEED SAMPLE DATA
+    # ========================================================
 
     @app.route(
         "/api/seed",
@@ -457,16 +539,24 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
             for sample in SAMPLE_CERTIFICATES:
 
+                # Skip duplicate records
                 if has_record(
                     sample["record_id"]
                 ):
 
                     skipped += 1
+
                     continue
 
-                data, _ = build_record(
+
+                data, error = build_record(
                     sample
                 )
+
+                if error:
+
+                    continue
+
 
                 issue(
                     data
@@ -474,33 +564,43 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
                 added += 1
 
+
             store.log_event(
+
                 "samples",
+
                 (
-                    f"Loaded {added} sample certificates "
+                    f"Loaded {added} "
+                    f"sample certificates "
                     f"({skipped} already present)"
                 )
             )
 
+
             return jsonify(
+
                 added=added,
+
                 skipped=skipped
             )
 
-    # -----------------------------------------------------
-    # Activity Events
-    # -----------------------------------------------------
+
+    # ========================================================
+    # ACTIVITY LOG
+    # ========================================================
 
     @app.route("/api/events")
     def events():
 
         return jsonify(
+
             events=store.recent_events()
         )
 
-    # -----------------------------------------------------
-    # Export Blockchain
-    # -----------------------------------------------------
+
+    # ========================================================
+    # EXPORT BLOCKCHAIN
+    # ========================================================
 
     @app.route("/api/export")
     def export():
@@ -510,25 +610,39 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
             chain = state["bc"]
 
             payload = json.dumps(
+
                 {
-                    "difficulty": chain.difficulty,
-                    "chain": chain.to_list()
+                    "difficulty":
+                        chain.difficulty,
+
+                    "chain":
+                        chain.to_list()
                 },
+
                 indent=2
             )
 
-        return Response(
-            payload,
-            mimetype="application/json",
-            headers={
-                "Content-Disposition":
-                    "attachment; filename=chaincert-chain.json"
-            }
-        )
 
-    # -----------------------------------------------------
-    # Reset Blockchain
-    # -----------------------------------------------------
+            return Response(
+
+                payload,
+
+                mimetype="application/json",
+
+                headers={
+                    "Content-Disposition":
+                    (
+                        "attachment; "
+                        "filename="
+                        "chaincert-chain.json"
+                    )
+                }
+            )
+
+
+    # ========================================================
+    # RESET BLOCKCHAIN
+    # ========================================================
 
     @app.route(
         "/api/reset",
@@ -538,68 +652,114 @@ def create_app(db_path=None, difficulty=DIFFICULTY):
 
         with lock:
 
+            # Create fresh blockchain
             state["bc"] = Blockchain(
                 state["bc"].difficulty
             )
 
+            # Save new chain
             store.save_chain(
                 state["bc"]
             )
 
+            # Log reset
             store.log_event(
                 "system",
                 "Chain reset to a new genesis block"
             )
 
+
             return jsonify(
                 ok=True
             )
 
-    # -----------------------------------------------------
-    # Return Flask Application
-    # -----------------------------------------------------
+
+    # ========================================================
+    # HEALTH CHECK
+    # ========================================================
+
+    @app.route("/api/health")
+    def health():
+
+        with lock:
+
+            report = (
+                state["bc"]
+                .validate_report()
+            )
+
+            return jsonify(
+
+                status="online",
+
+                blockchain_valid=(
+                    report["valid"]
+                ),
+
+                blocks=len(
+                    state["bc"].chain
+                ),
+
+                difficulty=(
+                    state["bc"].difficulty
+                )
+            )
+
+
+    # ========================================================
+    # RETURN FLASK APPLICATION
+    # ========================================================
 
     return app
 
 
-# =========================================================
-# VERCEL ENTRY POINT
-# =========================================================
-#
-# Vercel looks for a top-level Flask instance named "app".
-#
-# Do NOT rename this variable to flask_app.
-#
-# =========================================================
+# ============================================================
+# VERCEL / PRODUCTION ENTRY POINT
+# ============================================================
 
+# IMPORTANT:
+# Vercel looks for a top-level variable named "app".
 app = create_app()
 
 
-# =========================================================
+# ============================================================
 # LOCAL DEVELOPMENT
-# =========================================================
+# ============================================================
 
 if __name__ == "__main__":
+
+    # Optional:
+    # python app.py --seed
+    #
+    # This loads the sample certificates.
 
     if "--seed" in sys.argv:
 
         with app.test_client() as client:
 
-            print(
-                "Seeded:",
-                client.post(
-                    "/api/seed"
-                ).get_json()
+            response = client.post(
+                "/api/seed"
             )
 
+            print(
+                "Seeded:",
+                response.get_json()
+            )
+
+
+    # Start Flask locally
     app.run(
+
         host="127.0.0.1",
+
         port=int(
             os.environ.get(
                 "PORT",
                 "5000"
             )
         ),
+
         debug=False,
+
         threaded=True
     )
